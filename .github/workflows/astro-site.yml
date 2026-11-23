@@ -1,0 +1,130 @@
+# Cheap PR CI for an Astro site: install, (astro check), build, browser-free smoke
+# test + offline internal link check. Then auto-merge Dependabot minor/patch PRs.
+#
+# Caller (.github/workflows/ci.yml in the site repo):
+#
+#   on: { pull_request: { paths-ignore: ['*.md', 'docs/**'] }, workflow_dispatch: }
+#   concurrency: { group: ci-${{ github.event.pull_request.number || github.ref }}, cancel-in-progress: true }
+#   permissions: { contents: write, pull-requests: write, actions: write }
+#   jobs:
+#     ci:
+#       uses: ArnaudRinquin/astro-site-ci/.github/workflows/astro-site.yml@v1
+name: astro-site
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version; default reads .node-version / .nvmrc, else 24
+        type: string
+        default: ''
+      base:
+        description: Astro base path (if the site sets `base`)
+        type: string
+        default: /
+      umami:
+        description: Require the Umami snippet on every page
+        type: boolean
+        default: true
+      ignore-links:
+        description: Regexes (comma/newline separated) of internal paths the link check skips
+        type: string
+        default: ''
+      deploy-workflow:
+        description: Workflow file to dispatch after a Dependabot auto-merge (GITHUB_TOKEN merges don't fire `push`)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - id: detect
+        shell: bash
+        env:
+          NODE_INPUT: ${{ inputs.node-version }}
+        run: |
+          node="$NODE_INPUT"
+          [ -z "$node" ] && [ -f .node-version ] && node=$(tr -d ' \nv' < .node-version)
+          [ -z "$node" ] && [ -f .nvmrc ] && node=$(tr -d ' \nv' < .nvmrc)
+          echo "node=${node:-24}" >> "$GITHUB_OUTPUT"
+          if   [ -f pnpm-lock.yaml ]; then echo "pm=pnpm" >> "$GITHUB_OUTPUT"; echo "install=pnpm install --frozen-lockfile" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ];      then echo "pm=yarn" >> "$GITHUB_OUTPUT"; echo "install=yarn install --frozen-lockfile" >> "$GITHUB_OUTPUT"
+          else                             echo "pm=npm"  >> "$GITHUB_OUTPUT"; echo "install=npm ci --no-audit --no-fund" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -q '"@astrojs/check"' package.json; then echo "check=true" >> "$GITHUB_OUTPUT"; fi
+
+      - if: steps.detect.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.detect.outputs.node }}
+          cache: ${{ steps.detect.outputs.pm }}
+
+      - name: Install
+        run: ${{ steps.detect.outputs.install }}
+
+      - name: astro check
+        if: steps.detect.outputs.check == 'true'
+        run: npx astro check
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke test + internal links
+        uses: ArnaudRinquin/astro-site-ci/smoke@v1
+        with:
+          base: ${{ inputs.base }}
+          umami: ${{ inputs.umami }}
+          ignore-links: ${{ inputs.ignore-links }}
+
+  # Separate job so Dependabot's code (npm ci/build) never runs with a write token.
+  dependabot:
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge minor/patch
+        if: steps.meta.outputs.update-type == 'version-update:semver-minor' || steps.meta.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+          DEPLOY: ${{ inputs.deploy-workflow }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          gh pr merge "$PR" --squash --delete-branch
+          if [ -n "$DEPLOY" ]; then gh workflow run "$DEPLOY" --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"; fi
+
+      - name: Flag major
+        if: steps.meta.outputs.update-type != 'version-update:semver-minor' && steps.meta.outputs.update-type != 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+          TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          msg="major: needs Arnaud"
+          [ "$TYPE" = "version-update:semver-major" ] || msg="$msg (update-type: ${TYPE:-unknown})"
+          if ! gh pr view "$PR" --json comments --jq '.comments[].body' | grep -qF "major: needs Arnaud"; then
+            gh pr comment "$PR" --body "$msg"
+          fi
