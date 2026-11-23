@@ -1,0 +1,25 @@
+name: Static site smoke test
+description: Serve dist/ locally, check every sitemap page (200, <title>, Umami) and all internal links. No browser.
+inputs:
+  dist:
+    description: Build output directory
+    default: dist
+  base:
+    description: Astro base path
+    default: /
+  umami:
+    description: Require the Umami snippet (edge.arnaud.codes/app.js) on every page
+    default: 'true'
+  ignore-links:
+    description: Comma/newline separated regexes of internal paths to skip (e.g. other Pages projects on the same domain)
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        DIST: ${{ inputs.dist }}
+        BASE: ${{ inputs.base }}
+        UMAMI: ${{ inputs.umami }}
+        IGNORE: ${{ inputs.ignore-links }}
+      run: node "$GITHUB_ACTION_PATH/smoke.mjs" --dist "$DIST" --base "$BASE" --umami "$UMAMI" --ignore "$IGNORE"
